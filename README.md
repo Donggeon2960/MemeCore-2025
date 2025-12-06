@@ -137,4 +137,3 @@ Swap: Go to "Exchange" tab, enter points. Tokens arrive in MetaMask instantly.
 
 ---
 
-### 6. 
