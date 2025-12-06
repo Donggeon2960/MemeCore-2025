@@ -146,18 +146,14 @@ function AiQuestSection({ user, onUpdateUser }) {
   );
 }
 
+// App.js 내부 SnsQuestSection
+
 function SnsQuestSection({ user, onUpdateUser }) {
   const [file, setFile] = useState(null);
   const [snsUrl, setSnsUrl] = useState('');
   const [preview, setPreview] = useState(null);
   const [platform, setPlatform] = useState('YouTube');
   const [loading, setLoading] = useState(false);
-
-  const viralContent = {
-    imageUrl: "https://i.imgur.com/L9wW2V7.png",
-    hashTags: "#MemeQuest #밈퀘스트 #AI밈 #크립토",
-    description: "AI가 밈을 평가해주는 곳이 있다고?! ㅋㅋㅋ"
-  };
 
   const handleSubmit = async () => {
     if (!file) return alert("스크린샷을 업로드해주세요!");
@@ -191,24 +187,34 @@ function SnsQuestSection({ user, onUpdateUser }) {
       {loading && <LoadingOverlay message="AI가 스크린샷 및 데이터를 분석 중입니다..." />}
       <h3 className="font-bold text-xl mb-4">SNS 공유 인증 (AI 자동 검사)</h3>
       
-      <div className="mb-6 p-4" style={{background: 'linear-gradient(45deg, #4c1d95, #1e293b)', borderRadius: '1rem', border: '1px solid #7c3aed'}}>
-        <div className="badge badge-purple mb-2">🔥 오늘의 바이럴 콘텐츠</div>
-        <div className="flex gap-4 items-center">
-          <img src={viralContent.imageUrl} alt="Viral" style={{width: '80px', height: '80px', objectFit: 'cover', borderRadius: '0.5rem'}} />
-          <div style={{flex: 1}}>
-            <p className="text-sm text-white font-bold mb-1">이 짤을 SNS에 올려주세요!</p>
-            <p className="text-xs text-sub mb-2">추천 태그: {viralContent.hashTags}</p>
-            <a href={viralContent.imageUrl} target="_blank" rel="noreferrer" className="text-xs text-accent underline">⬇️ 이미지 다운로드</a>
-          </div>
+      {/* [NEW] 창작 & 리믹스 선택 안내 섹션 */}
+      <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
+        {/* 옵션 1: 창작 */}
+        <div style={{ flex: 1, background: 'rgba(147, 51, 234, 0.1)', border: '1px solid #9333ea', borderRadius: '1rem', padding: '1.5rem 1rem', textAlign: 'center' }}>
+          <div style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>✨</div>
+          <h4 style={{ fontWeight: 'bold', marginBottom: '0.5rem', color: '#c084fc' }}>자신만의 밈 만들기</h4>
+          <p style={{ fontSize: '0.8rem', color: '#cbd5e1', lineHeight: '1.4' }}>
+            당신의 기발한 아이디어로<br/>오리지널 영상을 만들어<br/>SNS에 올려주세요!
+          </p>
+        </div>
+
+        {/* 옵션 2: 리믹스 */}
+        <div style={{ flex: 1, background: 'rgba(245, 158, 11, 0.1)', border: '1px solid #f59e0b', borderRadius: '1rem', padding: '1.5rem 1rem', textAlign: 'center' }}>
+          <div style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>🧬</div>
+          <h4 style={{ fontWeight: 'bold', marginBottom: '0.5rem', color: '#fbbf24' }}>기존 밈 리믹스</h4>
+          <p style={{ fontSize: '0.8rem', color: '#cbd5e1', lineHeight: '1.4' }}>
+            유행하는 밈 소스를<br/>내 스타일로 패러디해서<br/>SNS에 올려주세요!
+          </p>
         </div>
       </div>
 
+      {/* 미션 가이드 (기존 유지) */}
       <div className="mb-6 p-4 bg-gray-800 rounded-lg border border-gray-600">
         <div className="text-sm text-sub mb-2">💡 미션 가이드</div>
         <ol className="text-sm space-y-2 pl-4 text-gray-300">
-          <li>위 콘텐츠를 SNS(유튜브 등)에 업로드하세요.</li>
+          <li>위 주제 중 하나를 골라 SNS(유튜브 등)에 업로드하세요.</li>
           <li>설명란에 <strong>내 고유 코드</strong>를 꼭 적어주세요.</li>
-          <li><strong>코드가 보이는 화면을 캡처</strong>해서 업로드하세요.</li>
+          <li><strong>코드가 보이는 화면을 캡처(스크린샷)</strong>해서 업로드하세요.</li>
         </ol>
         <div className="mt-4 p-3 bg-black rounded text-center border border-dashed border-gray-500">
           <span className="text-sub text-xs">스크린샷에 이 글자가 꼭 있어야 해요!</span>
@@ -216,6 +222,7 @@ function SnsQuestSection({ user, onUpdateUser }) {
         </div>
       </div>
 
+      {/* 입력 폼 (기존 유지) */}
       <div className="input-group">
         <label className="input-label">게시물 링크 (URL)</label>
         <input type="text" className="login-input" placeholder="https://..." value={snsUrl} onChange={e => setSnsUrl(e.target.value)} />
