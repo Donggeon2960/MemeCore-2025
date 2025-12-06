@@ -1,0 +1,103 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int           @id @default(autoincrement())
+  loginId       String        @unique @map("login_id")
+  password      String
+  walletAddress String?       @map("wallet_address")
+  nickname      String
+  userCode      String        @unique @map("user_code")
+  
+  // [수정] 현재 보유 포인트 (환전 시 차감됨)
+  points        Int           @default(0)
+  
+  // [NEW] 주간 랭킹용 누적 포인트 (환전해도 유지됨, 매주 초기화)
+  weeklyPoints  Int           @default(0) @map("weekly_points")
+
+  isAdmin       Boolean       @default(false) @map("is_admin")
+  lastNicknameChange DateTime? @map("last_nickname_change")
+
+  createdQuests Quest[]
+  submissions   Submission[]
+  likes         Like[]        // 유저가 누른 좋아요들
+  comments      Comment[]     // 유저가 쓴 댓글들
+  createdAt     DateTime      @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+model Quest {
+  id           Int           @id @default(autoincrement())
+  creatorId    Int?          @map("creator_id")
+  creator      User?         @relation(fields: [creatorId], references: [id])
+  title        String
+  content      String?
+  targetViews  Int           @default(0) @map("target_views")
+  rewardPoints Int           @map("reward_points")
+  
+  // [NEW] 퀘스트 종류 구분 (NORMAL: 일반/AI, EVENT: 이벤트)
+  category     String        @default("NORMAL") 
+
+  submissions  Submission[]
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  @@map("quests")
+}
+
+model Submission {
+  id             Int              @id @default(autoincrement())
+  userId         Int              @map("user_id")
+  user           User             @relation(fields: [userId], references: [id])
+  questId        Int              @map("quest_id")
+  quest          Quest            @relation(fields: [questId], references: [id])
+  
+  imageUrl       String           @map("image_url")
+  status         String           @default("PENDING")
+  aiScore        Int              @default(0) @map("ai_score")
+  
+  // [NEW] SNS URL 중복 방지
+  snsUrl         String?          @unique @map("sns_url")
+
+  // [수정] 좋아요는 이제 카운트가 아니라 관계형으로 관리 (무한 클릭 방지)
+  likes          Like[]
+  comments       Comment[]
+  
+  submittedAt    DateTime         @default(now()) @map("submitted_at")
+
+  @@map("submissions")
+}
+
+// [NEW] 좋아요 중복 방지 모델
+model Like {
+  id           Int        @id @default(autoincrement())
+  userId       Int        @map("user_id")
+  user         User       @relation(fields: [userId], references: [id])
+  submissionId Int        @map("submission_id")
+  submission   Submission @relation(fields: [submissionId], references: [id])
+
+  // 유저당 게시물 하나에 좋아요는 한 번만
+  @@unique([userId, submissionId]) 
+  @@map("likes")
+}
+
+// [NEW] 댓글 모델
+model Comment {
+  id           Int        @id @default(autoincrement())
+  content      String
+  userId       Int        @map("user_id")
+  user         User       @relation(fields: [userId], references: [id])
+  submissionId Int        @map("submission_id")
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@map("comments")
+}

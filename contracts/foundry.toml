@@ -1,0 +1,5 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+evm_version = "paris"  # <--- 이 부분이 핵심입니다!
