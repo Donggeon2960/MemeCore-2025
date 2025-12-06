@@ -53,6 +53,10 @@ model Quest {
   @@map("quests")
 }
 
+// ... (기존 코드)
+
+// ... (기존 코드)
+
 model Submission {
   id             Int              @id @default(autoincrement())
   userId         Int              @map("user_id")
@@ -63,18 +67,23 @@ model Submission {
   imageUrl       String           @map("image_url")
   status         String           @default("PENDING")
   aiScore        Int              @default(0) @map("ai_score")
-  
-  // [NEW] SNS URL 중복 방지
   snsUrl         String?          @unique @map("sns_url")
+  lastViewCount  Int              @default(0) @map("last_view_count")
+  lastLikeCount  Int              @default(0) @map("last_like_count")
 
-  // [수정] 좋아요는 이제 카운트가 아니라 관계형으로 관리 (무한 클릭 방지)
+  // [NEW] 이 제출로 획득한 포인트 기록 (히스토리용)
+  earnedPoints   Int              @default(0) @map("earned_points")
+
   likes          Like[]
   comments       Comment[]
-  
   submittedAt    DateTime         @default(now()) @map("submitted_at")
 
   @@map("submissions")
 }
+
+// ...
+
+// ... (나머지 동일)
 
 // [NEW] 좋아요 중복 방지 모델
 model Like {
