@@ -1,12 +1,16 @@
 import { NestFactory } from '@nestjs/core';
+import { ConfigService } from '@nestjs/config';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-
-  // [여기 추가!] 프론트엔드(React)의 접속을 허용합니다.
-  app.enableCors();
-
-  await app.listen(process.env.PORT ?? 3000);
+  const config = app.get(ConfigService);
+  // 프론트엔드 주소만 허용 (FRONTEND_URL 미설정 시 CRA 개발 서버)
+  app.enableCors({
+    origin: (config.get<string>('FRONTEND_URL') || 'http://localhost:3001')
+      .split(',')
+      .map((o) => o.trim()),
+  });
+  await app.listen(config.get<string>('PORT') ?? 3000);
 }
-bootstrap();
+void bootstrap();

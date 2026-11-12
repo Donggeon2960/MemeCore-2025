@@ -3,7 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { BlockchainService } from './blockchain.service';
 
 @Module({
-  imports: [ConfigModule], 
+  imports: [ConfigModule],
   providers: [BlockchainService],
   exports: [BlockchainService],
 })

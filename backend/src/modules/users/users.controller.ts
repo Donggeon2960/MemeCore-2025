@@ -1,15 +1,49 @@
-import { Controller, Post, Body, Get, Query, UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Post,
+  Query,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'path';
-import { readFileSync } from 'fs';
+import { Throttle } from '@nestjs/throttler';
+import { Prisma } from '@prisma/client';
+import type { User } from '@prisma/client';
 
-import { UsersService } from './users.service';
+import {
+  EVENT_PRIZES,
+  isEventOpen,
+  publicUser,
+  str,
+  UsersService,
+} from './users.service';
 import { AiService } from '../ai/ai.service';
 import { PrismaService } from '../../prisma.service';
-import { YoutubeService } from '../youtube.service';
+import {
+  extractVideoId,
+  normalizeSnsUrl,
+  SNS_BASE_REWARD,
+  SNS_BONUS_MIN_VIEWS,
+  snsBonus,
+  YoutubeService,
+} from '../youtube.service';
+import { AdminGuard, AuthGuard, CurrentUser } from '../../auth';
+import { imageUpload, readImage, saveImage } from '../../uploads';
+
+const PLATFORMS = ['YouTube', 'Instagram', 'TikTok', 'X'];
+const WEEKLY_QUEST_LIMIT = 3;
+// AI 호출(유료)이 걸린 엔드포인트: IP당 분당 5회
+const AI_THROTTLE = { default: { limit: 5, ttl: 60_000 } };
+
+const isUniqueViolation = (e: unknown) =>
+  e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
 @Controller('api')
+@UseGuards(AuthGuard)
 export class UsersController {
   constructor(
     private readonly usersService: UsersService,
@@ -18,445 +52,459 @@ export class UsersController {
     private readonly youtubeService: YoutubeService,
   ) {}
 
-  // 1. 회원가입
-  @Post('register')
-  async register(@Body() body: { login_id: string; password?: string; wallet_address: string; nickname: string }) {
-    const pw = body.password || 'password123'; 
-    return this.usersService.register(body.login_id, pw, body.wallet_address, body.nickname);
-  }
-
-  // 2. 로그인
-  @Post('login')
-  async login(@Body() body: { login_id: string; password: string }) {
-    return this.usersService.login(body.login_id, body.password);
-  }
-
-  // 3. 코인 환전
   @Post('swap-to-token')
-  async swap(@Body() body: { login_id: string; amount: string | number }) {
-    return this.usersService.swapToToken(body.login_id, Number(body.amount));
-  }
-  
-  // 4. (테스트용) 포인트 받기
-  @Post('cheat-points')
-  async cheat(@Body() body: { login_id: string; amount: string | number }) {
-      return this.usersService.addPoints(body.login_id, Number(body.amount));
+  swap(@CurrentUser() user: User, @Body() body: { amount?: unknown }) {
+    return this.usersService.swapToToken(user, body.amount);
   }
 
-  // 5. 주간 랭킹 조회
   @Get('rankings')
-  async getRankings() {
+  getRankings() {
     return this.usersService.getTopRankings();
   }
 
-  // 주간 랭킹 초기화 (관리자용)
   @Post('reset-ranking')
-  async resetRanking() {
+  @UseGuards(AdminGuard)
+  resetRanking() {
     return this.usersService.resetWeeklyRanking();
   }
 
-  // 6. 내 등수 확인
   @Get('my-rank')
-  async getMyRank(@Query('login_id') loginId: string) {
-    return this.usersService.getMyRank(loginId);
+  getMyRank(@CurrentUser() user: User) {
+    return this.usersService.getMyRank(user);
   }
 
-  // 7. 퀘스트 생성 (주간 3회 제한)
+  // 퀘스트 생성 (주간 3회 제한)
   @Post('generate-quest')
-  async generateQuest(@Body() body: { login_id: string }) {
-    const user = await this.prisma.user.findUnique({ where: { loginId: body.login_id } });
-    if (!user) throw new BadRequestException('User not found');
-
-    const oneWeekAgo = new Date();
-    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-    
+  @Throttle(AI_THROTTLE)
+  async generateQuest(@CurrentUser() user: User) {
+    const oneWeekAgo = new Date(Date.now() - 7 * 86_400_000);
     const count = await this.prisma.quest.count({
       where: {
         creatorId: user.id,
-        createdAt: { gte: oneWeekAgo }
-      }
+        category: 'NORMAL',
+        createdAt: { gte: oneWeekAgo },
+      },
     });
-
-    if (count >= 3) {
-      throw new BadRequestException('주간 퀘스트 생성 한도(3회)를 초과했습니다.');
-    }
+    if (count >= WEEKLY_QUEST_LIMIT)
+      throw new BadRequestException(
+        `주간 퀘스트 생성 한도(${WEEKLY_QUEST_LIMIT}회)를 초과했습니다.`,
+      );
 
     const aiQuest = await this.aiService.generateDailyQuest();
-    
-    const savedQuest = await this.prisma.quest.create({
-      data: {
-        creatorId: user.id,
-        title: aiQuest.title,
-        content: aiQuest.content,
-        targetViews: aiQuest.targetViews,
-        rewardPoints: aiQuest.rewardPoints,
-        category: 'NORMAL' // 일반 퀘스트
-      }
+    return this.prisma.quest.create({
+      data: { ...aiQuest, creatorId: user.id, category: 'NORMAL' },
     });
-
-    return savedQuest;
   }
 
-  // 8. 나의 퀘스트 목록 조회 (완료 여부 표시)
   @Get('my-quests')
-  async getMyQuests(@Query('login_id') loginId: string) {
-    const user = await this.prisma.user.findUnique({ where: { loginId } });
-    if (!user) return [];
-    
+  async getMyQuests(@CurrentUser() user: User) {
     const quests = await this.prisma.quest.findMany({
       where: { creatorId: user.id, category: 'NORMAL' },
       orderBy: { createdAt: 'desc' },
-      include: { submissions: true }
     });
-
-    return quests.map(q => {
-        const isCompleted = q.submissions.some(sub => 
-            sub.userId === user.id && sub.status === 'APPROVED'
-        );
-        const { submissions, ...rest } = q;
-        return { ...rest, isCompleted };
-    });
-  }
-
-  // 9. 밈 인증 (이미지 저장 + AI 검증)
-  @Post('verify-meme')
-  @UseInterceptors(FileInterceptor('image', {
-    storage: diskStorage({
-      destination: './uploads',
-      filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, `${uniqueSuffix}${extname(file.originalname)}`);
-      }
-    })
-  }))
-  async verifyMeme(
-    @UploadedFile() file: any, 
-    @Body() body: { login_id: string; quest_id: string }
-  ) {
-    if (!file) throw new BadRequestException('Image file is missing');
-    
-    const user = await this.prisma.user.findUnique({ where: { loginId: body.login_id } });
-    const quest = await this.prisma.quest.findUnique({ where: { id: Number(body.quest_id) } });
-    
-    if (!user || !quest) throw new BadRequestException('Invalid user or quest');
-
-    // 중복 제출 방지
-    const existing = await this.prisma.submission.findFirst({
-        where: { userId: user.id, questId: quest.id, status: 'APPROVED' }
-    });
-    if (existing) throw new BadRequestException("이미 완료한 퀘스트입니다.");
-
-    const imageBuffer = readFileSync(file.path);
-    const aiResult = await this.aiService.verifyMemeImage(imageBuffer, quest.title);
-
-    await this.prisma.submission.create({
-      data: {
-        userId: user.id,
-        questId: quest.id,
-        imageUrl: `/uploads/${file.filename}`,
-        status: aiResult.isPass ? 'APPROVED' : 'REJECTED',
-        aiScore: aiResult.score,
-        earnedPoints: aiResult.isPass ? quest.rewardPoints : 0
-      }
-    });
-
-    if (aiResult.isPass) {
-      await this.usersService.addPoints(body.login_id, quest.rewardPoints);
-    }
-
-    return { 
-        ...aiResult, 
-        imageUrl: `/uploads/${file.filename}` 
-    };
-  }
-
-  // 10. 갤러리 목록 조회 (일반 퀘스트만, 좋아요/댓글 포함)
-  @Get('gallery')
-  async getGallery(@Query('login_id') loginId: string) {
-    const submissions = await this.prisma.submission.findMany({
-      where: { status: 'APPROVED', quest: { category: 'NORMAL' } },
-      orderBy: { submittedAt: 'desc' },
-      include: { 
-        user: { select: { nickname: true } },
-        quest: { select: { title: true } },
-        likes: true, 
-        comments: { include: { user: { select: { nickname: true } } } } 
-      }
-    });
-
-    const user = loginId ? await this.prisma.user.findUnique({ where: { loginId } }) : null;
-    
-    return submissions.map(sub => ({
-      ...sub,
-      likeCount: sub.likes.length,
-      isLiked: user ? sub.likes.some(l => l.userId === user.id) : false,
-      likes: undefined 
+    return quests.map(({ completedAt, ...q }) => ({
+      ...q,
+      isCompleted: !!completedAt,
     }));
   }
 
-  // 11. 좋아요 토글
-  @Post('like-image')
-  async likeImage(@Body() body: { login_id: string; submission_id: number }) {
-    return this.usersService.toggleLike(body.login_id, body.submission_id);
-  }
-
-  // 댓글 작성
-  @Post('comment')
-  async addComment(@Body() body: { login_id: string; submission_id: number; content: string }) {
-    return this.usersService.addComment(body.login_id, body.submission_id, body.content);
-  }
-
-  // 12. SNS 퀘스트 인증 (유튜브 통계 + AI 검증 + 포인트 내역 저장)
-  @Post('submit-social')
-  @UseInterceptors(FileInterceptor('image', {
-    storage: diskStorage({
-      destination: './uploads',
-      filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, `sns-${uniqueSuffix}${extname(file.originalname)}`);
-      }
-    })
-  }))
-  async submitSocial(
-    @UploadedFile() file: any,
-    @Body() body: { login_id: string; platform: string; sns_url: string }
+  // 밈 인증 (AI 검증 통과 시 이미지 저장 + 보상)
+  @Post('verify-meme')
+  @Throttle(AI_THROTTLE)
+  @UseInterceptors(FileInterceptor('image', imageUpload))
+  async verifyMeme(
+    @CurrentUser() user: User,
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: { quest_id?: unknown },
   ) {
-    if (!file) throw new BadRequestException('Screenshot missing');
-    if (!body.sns_url) throw new BadRequestException('SNS URL is missing');
-
-    const existing = await this.prisma.submission.findUnique({ where: { snsUrl: body.sns_url } });
-    if (existing) throw new BadRequestException('이미 제출된 게시물 URL입니다.');
-
-    const user = await this.prisma.user.findUnique({ where: { loginId: body.login_id } });
-    if (!user) throw new BadRequestException('User not found');
-
-    let isPass = false;
-    let reason = "";
-    let finalStatus = "REJECTED";
-    
-    const BASE_REWARD = 300;
-    let totalReward = 0;
-    let bonusDetail = "";
-    let currentViews = 0;
-    let currentLikes = 0;
-
-    // 유튜브 URL이면 API 조회
-    if (body.platform === 'YouTube' || body.sns_url.includes('youtu')) {
-        try {
-            const stats = await this.youtubeService.getVideoStats(body.sns_url);
-            console.log(`📊 YouTube Stats: View ${stats.viewCount}, Like ${stats.likeCount}`);
-            
-            currentViews = stats.viewCount;
-            currentLikes = stats.likeCount;
-
-            if (stats.viewCount >= 100) {
-                isPass = true;
-                finalStatus = "APPROVED";
-                const viewBonus = Math.floor(stats.viewCount * 0.5);
-                const likeBonus = stats.likeCount * 10;
-                totalReward = BASE_REWARD + viewBonus + likeBonus;
-                reason = `조회수(${stats.viewCount}) 달성! 추가 보너스 지급됨.`;
-                bonusDetail = `기본(${BASE_REWARD}) + 조회수보너스(${viewBonus}) + 좋아요보너스(${likeBonus})`;
-            }
-        } catch (e) {
-            console.error("유튜브 조회 실패, AI 검사로 대체");
-        }
-    }
-
-    if (!isPass) {
-        const imageBuffer = readFileSync(file.path);
-        const aiResult = await this.aiService.verifySocialPost(imageBuffer, user.userCode, body.platform);
-        isPass = aiResult.isPass;
-        reason = aiResult.reason;
-        finalStatus = isPass ? "APPROVED" : "REJECTED";
-        if (isPass) {
-            totalReward = BASE_REWARD;
-            bonusDetail = "기본 보상 지급";
-        }
-    }
-
-    await this.prisma.submission.create({
-      data: {
-        userId: user.id,
-        questId: 1, 
-        imageUrl: `/uploads/${file.filename}`,
-        status: finalStatus,
-        aiScore: 0,
-        snsUrl: body.sns_url,
-        lastViewCount: currentViews,
-        lastLikeCount: currentLikes,
-        earnedPoints: (isPass && totalReward > 0) ? totalReward : 0
-      }
+    const img = readImage(file);
+    const quest = await this.prisma.quest.findUnique({
+      where: { id: Number(body.quest_id) || 0 },
     });
+    // 내가 만든 일반 퀘스트만 제출 가능
+    if (!quest || quest.category !== 'NORMAL' || quest.creatorId !== user.id)
+      throw new BadRequestException('존재하지 않는 퀘스트입니다.');
+    if (quest.completedAt)
+      throw new BadRequestException('이미 완료한 퀘스트입니다.');
 
-    if (isPass && totalReward > 0) {
-      await this.usersService.addPoints(body.login_id, totalReward);
-    }
+    const aiResult = await this.aiService.verifyMemeImage(
+      img.buffer,
+      img.mime,
+      quest.title,
+    );
+    if (!aiResult.isPass) return aiResult; // 불합격 이미지는 저장하지 않음
 
-    return { 
-      status: isPass ? 'success' : 'fail',
-      reason: reason,
-      reward: totalReward,
-      bonusDetail: bonusDetail 
-    };
+    const imageUrl = await saveImage(img, 'meme');
+    // completedAt 조건부 UPDATE: 동시에 두 번 제출해도 보상은 한 번만
+    await this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.quest.updateMany({
+        where: { id: quest.id, completedAt: null },
+        data: { completedAt: new Date() },
+      });
+      if (count === 0)
+        throw new BadRequestException('이미 완료한 퀘스트입니다.');
+      const sub = await tx.submission.create({
+        data: {
+          userId: user.id,
+          questId: quest.id,
+          imageUrl,
+          status: 'APPROVED',
+          aiScore: aiResult.score,
+          earnedPoints: quest.rewardPoints,
+        },
+      });
+      await this.usersService.addPoints(
+        user.id,
+        quest.rewardPoints,
+        'AI_QUEST',
+        sub.id,
+        tx,
+      );
+    });
+    return { ...aiResult, imageUrl, reward: quest.rewardPoints };
   }
 
-  // 13. 이벤트 퀘스트 작품 제출 (자동 생성 포함)
-  @Post('submit-event')
-  @UseInterceptors(FileInterceptor('image', {
-    storage: diskStorage({
-      destination: './uploads',
-      filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, `event-${uniqueSuffix}${extname(file.originalname)}`);
-      }
-    })
-  }))
-  async submitEvent(
-    @UploadedFile() file: any,
-    @Body() body: { login_id: string; event_id: string }
-  ) {
-    if (!file) throw new BadRequestException('File missing');
-
-    const user = await this.prisma.user.findUnique({ where: { loginId: body.login_id } });
-    if (!user) throw new BadRequestException('User not found');
-
-    let realQuestId = Number(body.event_id);
-    
-    if (realQuestId === 101 || realQuestId === 102) {
-        const eventTitle = realQuestId === 101 ? "슬픈 개구리 (페페)" : "도지 투 더 문";
-        let quest = await this.prisma.quest.findFirst({ where: { title: { contains: eventTitle } } });
-
-        if (!quest) {
-            quest = await this.prisma.quest.create({
-                data: {
-                    title: eventTitle + " 챌린지",
-                    content: "이벤트 퀘스트",
-                    targetViews: 0,
-                    rewardPoints: 500,
-                    creatorId: null,
-                    category: 'EVENT'
-                }
-            });
-        } else {
-            if (quest.category !== 'EVENT') {
-                await this.prisma.quest.update({ where: { id: quest.id }, data: { category: 'EVENT' } });
-            }
-        }
-        realQuestId = quest.id;
-    }
-
-    await this.prisma.submission.create({
-      data: {
-        userId: user.id,
-        questId: realQuestId, 
-        imageUrl: `/uploads/${file.filename}`,
+  // 갤러리 (AI 퀘스트 통과작)
+  @Get('gallery')
+  async getGallery(@CurrentUser() user: User, @Query('page') pageRaw?: string) {
+    const page = Math.max(1, Number(pageRaw) || 1);
+    const submissions = await this.prisma.submission.findMany({
+      where: {
         status: 'APPROVED',
-        aiScore: 0,
-        earnedPoints: 0
-      }
+        snsUrl: null,
+        quest: { category: 'NORMAL' },
+      },
+      orderBy: { submittedAt: 'desc' },
+      take: 30,
+      skip: (page - 1) * 30,
+      include: {
+        user: { select: { nickname: true } },
+        quest: { select: { title: true } },
+        likes: { select: { userId: true } },
+        comments: {
+          include: { user: { select: { nickname: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
     });
+    return submissions.map(({ likes, ...sub }) => ({
+      ...sub,
+      likeCount: likes.length,
+      isLiked: likes.some((l) => l.userId === user.id),
+    }));
+  }
 
+  @Post('like-image')
+  likeImage(
+    @CurrentUser() user: User,
+    @Body() body: { submission_id?: unknown },
+  ) {
+    return this.usersService.toggleLike(user, body.submission_id);
+  }
+
+  @Post('comment')
+  addComment(
+    @CurrentUser() user: User,
+    @Body() body: { submission_id?: unknown; content?: unknown },
+  ) {
+    return this.usersService.addComment(user, body.submission_id, body.content);
+  }
+
+  /**
+   * SNS 바이럴 인증
+   * - YouTube: 영상 설명란에 내 userCode 가 있어야 함 (본인 영상 확인). 조회수 100 이상이면 보너스
+   * - 그 외: 스크린샷 OCR 로 userCode 확인 → 기본 보상
+   */
+  @Post('submit-social')
+  @Throttle(AI_THROTTLE)
+  @UseInterceptors(FileInterceptor('image', imageUpload))
+  async submitSocial(
+    @CurrentUser() user: User,
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: { platform?: unknown; sns_url?: unknown },
+  ) {
+    const platform = str(body.platform, '플랫폼', 20);
+    if (!PLATFORMS.includes(platform))
+      throw new BadRequestException('지원하지 않는 플랫폼입니다.');
+    const rawUrl = str(body.sns_url, '게시물 URL', 500);
+    const img = readImage(file);
+
+    let snsUrl: string;
+    let reward = SNS_BASE_REWARD;
+    let views = 0;
+    let likes = 0;
+    let bonusDetail = '기본 보상';
+
+    if (platform === 'YouTube') {
+      const videoId = extractVideoId(rawUrl);
+      if (!videoId)
+        throw new BadRequestException('올바른 유튜브 영상 URL이 아닙니다.');
+      snsUrl = `https://youtu.be/${videoId}`; // 같은 영상의 다른 URL 형태로 중복 제출 방지
+      await this.assertNewSnsUrl(snsUrl);
+      const stats = await this.youtubeService.getVideoStats(videoId);
+      if (!stats.description.includes(user.userCode))
+        throw new BadRequestException(
+          `영상 설명란에 내 코드(${user.userCode})를 적은 뒤 다시 제출해주세요.`,
+        );
+      views = stats.viewCount;
+      likes = stats.likeCount;
+      if (views >= SNS_BONUS_MIN_VIEWS) {
+        const bonus = snsBonus(views, likes);
+        reward += bonus;
+        bonusDetail = `기본(${SNS_BASE_REWARD}) + 조회수·좋아요 보너스(${bonus})`;
+      }
+    } else {
+      snsUrl = normalizeSnsUrl(platform, rawUrl);
+      await this.assertNewSnsUrl(snsUrl);
+      const aiResult = await this.aiService.verifySocialPost(
+        img.buffer,
+        img.mime,
+        user.userCode,
+        platform,
+      );
+      if (!aiResult.isPass) return { status: 'fail', reason: aiResult.reason };
+    }
+
+    const imageUrl = await saveImage(img, 'sns');
+    const snsQuest = await this.prisma.quest.findFirstOrThrow({
+      where: { category: 'SNS' },
+    });
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const sub = await tx.submission.create({
+          data: {
+            userId: user.id,
+            questId: snsQuest.id,
+            imageUrl,
+            status: 'APPROVED',
+            snsUrl,
+            lastViewCount: views,
+            lastLikeCount: likes,
+            earnedPoints: reward,
+          },
+        });
+        await this.usersService.addPoints(user.id, reward, 'SNS', sub.id, tx);
+      });
+    } catch (e) {
+      // 동시에 같은 URL 이 들어와도 DB unique 제약이 최종 방어
+      if (isUniqueViolation(e))
+        throw new BadRequestException('이미 제출된 게시물 URL입니다.');
+      throw e;
+    }
+    return { status: 'success', reason: '인증 완료!', reward, bonusDetail };
+  }
+
+  private async assertNewSnsUrl(snsUrl: string) {
+    if (await this.prisma.submission.findUnique({ where: { snsUrl } }))
+      throw new BadRequestException('이미 제출된 게시물 URL입니다.');
+  }
+
+  // 진행/종료 이벤트 목록
+  @Get('events')
+  async getEvents() {
+    const events = await this.prisma.quest.findMany({
+      where: { category: 'EVENT' },
+      orderBy: { endsAt: 'desc' },
+      include: { _count: { select: { submissions: true } } },
+    });
+    return events.map(({ _count, ...e }) => ({
+      ...e,
+      entryCount: _count.submissions,
+      isOpen: isEventOpen(e),
+      prizes: EVENT_PRIZES,
+    }));
+  }
+
+  // 이벤트 작품 제출: 마감 전, 1인 1작품
+  @Post('submit-event')
+  @UseInterceptors(FileInterceptor('image', imageUpload))
+  async submitEvent(
+    @CurrentUser() user: User,
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: { event_id?: unknown },
+  ) {
+    const img = readImage(file);
+    const event = await this.eventOrThrow(body.event_id);
+    if (!isEventOpen(event))
+      throw new BadRequestException('마감된 이벤트입니다.');
+    if (
+      await this.prisma.submission.findFirst({
+        where: { questId: event.id, userId: user.id },
+      })
+    )
+      throw new BadRequestException('이벤트당 한 작품만 출품할 수 있습니다.');
+
+    const imageUrl = await saveImage(img, 'event');
+    await this.prisma.submission.create({
+      data: {
+        userId: user.id,
+        questId: event.id,
+        imageUrl,
+        status: 'APPROVED',
+      },
+    });
     return { status: 'success', message: '이벤트 참여 완료!' };
   }
 
-  // 14. 이벤트 참가작 조회
   @Get('event-entries')
-  async getEventEntries(@Query('event_id') eventId: string) {
-    let realQuestId = Number(eventId);
-    if (realQuestId === 101 || realQuestId === 102) {
-        const eventTitle = realQuestId === 101 ? "슬픈 개구리 (페페)" : "도지 투 더 문";
-        const quest = await this.prisma.quest.findFirst({ where: { title: { contains: eventTitle } } });
-        if (!quest) return [];
-        realQuestId = quest.id;
-    }
-
-    const submissions = await this.prisma.submission.findMany({
-      where: { questId: realQuestId, status: 'APPROVED' },
-      orderBy: { submittedAt: 'desc' },
-      include: { user: { select: { nickname: true } }, likes: true }
+  async getEventEntries(
+    @CurrentUser() user: User,
+    @Query('event_id') eventId: string,
+  ) {
+    const event = await this.eventOrThrow(eventId);
+    const subs = await this.prisma.submission.findMany({
+      where: { questId: event.id, status: 'APPROVED' },
+      orderBy: [{ likes: { _count: 'desc' } }, { submittedAt: 'asc' }], // 정산과 같은 순서
+      include: {
+        user: { select: { nickname: true } },
+        likes: { select: { userId: true } },
+      },
     });
-
-    return submissions.map(sub => ({ ...sub, likes: sub.likes.length })).sort((a, b) => b.likes - a.likes);
+    return subs.map(({ likes, ...s }) => ({
+      ...s,
+      likes: likes.length,
+      isLiked: likes.some((l) => l.userId === user.id),
+    }));
   }
 
-  // 15. 내 정보 수정
+  private async eventOrThrow(id: unknown) {
+    const event = await this.prisma.quest.findUnique({
+      where: { id: Number(id) || 0 },
+    });
+    if (!event || event.category !== 'EVENT')
+      throw new BadRequestException('존재하지 않는 이벤트입니다.');
+    return event;
+  }
+
   @Post('update-profile')
-  async updateProfile(@Body() body: { login_id: string; nickname?: string; wallet_address?: string; password?: string }) {
-    return this.usersService.updateProfile(body.login_id, body.nickname, body.wallet_address, body.password);
+  updateProfile(
+    @CurrentUser() user: User,
+    @Body()
+    body: {
+      nickname?: unknown;
+      wallet_address?: unknown;
+      password?: unknown;
+      current_password?: unknown;
+    },
+  ) {
+    return this.usersService.updateProfile(user, body);
   }
 
-  // 16. 포인트 획득 내역 조회 (Null 체크 추가)
+  // 포인트 내역 (원장 기반 + 카테고리별 요약)
   @Get('point-history')
-  async getPointHistory(@Query('login_id') loginId: string) {
-    const user = await this.prisma.user.findUnique({ where: { loginId } });
-    if (!user) return { aiTotal: 0, snsList: [], eventList: [] };
-
-    const submissions = await this.prisma.submission.findMany({
-      where: { userId: user.id, status: 'APPROVED' },
-      include: { quest: true },
-      orderBy: { submittedAt: 'desc' }
-    });
-
-    const aiSubmissions = submissions.filter(s => s.quest.category === 'NORMAL' && !s.snsUrl);
-    const aiTotal = aiSubmissions.reduce((sum, s) => sum + s.earnedPoints, 0);
-
+  async getPointHistory(@CurrentUser() user: User) {
+    const [ledger, submissions] = await Promise.all([
+      this.prisma.pointLedger.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      }),
+      this.prisma.submission.findMany({
+        where: { userId: user.id, status: 'APPROVED' },
+        include: { quest: true },
+        orderBy: { submittedAt: 'desc' },
+      }),
+    ]);
+    const aiTotal = submissions
+      .filter((s) => s.quest.category === 'NORMAL' && !s.snsUrl)
+      .reduce((sum, s) => sum + s.earnedPoints, 0);
     const snsList = submissions
-      .filter(s => s.snsUrl)
-      .map(s => ({
+      .filter((s) => s.snsUrl)
+      .map((s) => ({
         id: s.id,
         platform: s.snsUrl?.includes('youtu') ? 'YouTube' : 'SNS',
         url: s.snsUrl,
         earnedPoints: s.earnedPoints,
         views: s.lastViewCount,
         likes: s.lastLikeCount,
-        date: s.submittedAt
+        date: s.submittedAt,
       }));
-
     const eventList = submissions
-      .filter(s => s.quest.category === 'EVENT')
-      .map(s => ({
+      .filter((s) => s.quest.category === 'EVENT')
+      .map((s) => ({
         id: s.id,
         title: s.quest.title,
         earnedPoints: s.earnedPoints,
-        date: s.submittedAt
+        date: s.submittedAt,
       }));
-
-    return { aiTotal, snsList, eventList };
+    return { aiTotal, snsList, eventList, ledger, user: publicUser(user) };
   }
 
-  // 17. 이벤트 랭킹 정산 및 보상 지급 (관리자용)
+  // 이벤트 정산 (관리자): 마감 후 1회만, 좋아요 순 Top 3
   @Post('reward-event-winners')
-  async rewardEventWinners(@Body() body: { event_id: string }) {
-    const questId = Number(body.event_id);
+  @UseGuards(AdminGuard)
+  async rewardEventWinners(@Body() body: { event_id?: unknown }) {
+    const event = await this.eventOrThrow(body.event_id);
+    if (event.settledAt)
+      throw new BadRequestException('이미 정산된 이벤트입니다.');
+    if (event.endsAt && event.endsAt > new Date())
+      throw new BadRequestException('마감 후에 정산할 수 있습니다.');
 
-    const top3 = await this.prisma.submission.findMany({
-      where: { questId, status: 'APPROVED' },
-      orderBy: { likes: { _count: 'desc' } },
-      take: 3,
-      include: { user: true }
-    });
-
-    if (top3.length === 0) return { message: "참여자가 없습니다." };
-
-    const prizes = [5000, 3000, 1000]; 
-    // [수정] results 배열의 타입을 string[]으로 명시 (TS 에러 해결)
-    const results: string[] = [];
-
-    for (let i = 0; i < top3.length; i++) {
-      const winner = top3[i];
-      const prize = prizes[i];
-      
-      await this.usersService.addPoints(winner.user.loginId, prize);
-      
-      await this.prisma.submission.update({
-        where: { id: winner.id },
-        data: { earnedPoints: { increment: prize } }
+    return this.prisma.$transaction(async (tx) => {
+      // settledAt 조건부 UPDATE: 동시에 눌러도 한 번만 지급
+      const { count } = await tx.quest.updateMany({
+        where: { id: event.id, settledAt: null },
+        data: { settledAt: new Date() },
       });
+      if (count === 0)
+        throw new BadRequestException('이미 정산된 이벤트입니다.');
 
-      results.push(`${i + 1}등: ${winner.user.nickname} (+${prize}P)`);
-    }
+      const top3 = await tx.submission.findMany({
+        where: { questId: event.id, status: 'APPROVED' },
+        orderBy: [{ likes: { _count: 'desc' } }, { submittedAt: 'asc' }],
+        take: EVENT_PRIZES.length,
+        include: { user: true },
+      });
+      const results: string[] = [];
+      for (const [i, winner] of top3.entries()) {
+        await this.usersService.addPoints(
+          winner.userId,
+          EVENT_PRIZES[i],
+          'EVENT_PRIZE',
+          winner.id,
+          tx,
+        );
+        await tx.submission.update({
+          where: { id: winner.id },
+          data: { earnedPoints: { increment: EVENT_PRIZES[i] } },
+        });
+        results.push(
+          `${i + 1}등: ${winner.user.nickname} (+${EVENT_PRIZES[i]}P)`,
+        );
+      }
+      return {
+        status: 'success',
+        results: results.length ? results : ['참여자가 없습니다.'],
+      };
+    });
+  }
 
-    return { status: 'success', results };
+  // 이벤트 생성 (관리자)
+  @Post('events')
+  @UseGuards(AdminGuard)
+  createEvent(
+    @Body()
+    body: {
+      title?: unknown;
+      description?: unknown;
+      token_icon?: unknown;
+      token_symbol?: unknown;
+      ends_at?: unknown;
+    },
+  ) {
+    const endsAt = new Date(str(body.ends_at, '마감일', 40));
+    if (Number.isNaN(endsAt.getTime()) || endsAt <= new Date())
+      throw new BadRequestException('마감일은 미래 날짜여야 합니다.');
+    return this.prisma.quest.create({
+      data: {
+        category: 'EVENT',
+        title: str(body.title, '제목', 100),
+        description: str(body.description, '설명', 1000, false),
+        tokenIcon: str(body.token_icon, '아이콘', 8, false) || '🏆',
+        tokenSymbol: str(body.token_symbol, '심볼', 10, false) || 'MQ',
+        rewardPoints: EVENT_PRIZES[0],
+        endsAt,
+      },
+    });
   }
 }
